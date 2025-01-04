@@ -4,32 +4,23 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-var (
-	listenAddress = flag.String("listen-address", ":8080", "The address to listen on for HTTP requests.")
+const (
+	listenAddress = ":8080"
 )
 
 var (
-	totalRealtimeRequests = prometheus.NewSummaryVec(
-		prometheus.SummaryOpts{
-			Namespace: "ngenix",
-			Subsystem: "realtime",
-			Name:      "requests_total",
-			Help:      "Total count of realtime requests",
-		},
-		[]string{"path"},
-	)
-
 	realtimeRequestsByPath = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Namespace: "ngenix",
@@ -93,9 +84,6 @@ type httpStatusResponse struct {
 }
 
 func main() {
-	flag.Parse()
-
-	prometheus.MustRegister(totalRealtimeRequests)
 	prometheus.MustRegister(realtimeRequestsByPath)
 	prometheus.MustRegister(realtimeRequestsByCode)
 
@@ -104,14 +92,14 @@ func main() {
 
 	http.Handle("/metrics", promhttp.Handler())
 
-	log.Printf("HTTP server listening on %s", *listenAddress)
-	if err := http.ListenAndServe(*listenAddress, nil); err != nil {
+	log.Printf("HTTP server listening on %s", listenAddress)
+	if err := http.ListenAndServe(listenAddress, nil); err != nil {
 		log.Fatalf("Error starting HTTP server: %v", err)
 	}
 }
 
 func fetchRealtimeRequestsByPath() {
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
 	for range ticker.C {
@@ -132,8 +120,9 @@ func fetchRealtimeRequestsByPath() {
 				continue
 			}
 
-			realtimeRequestsByPath.WithLabelValues(category.Name).Set(float64(category.Metrics.RealtimeRequests))
-			totalRealtimeRequests.WithLabelValues(category.Name).Observe(float64(category.Metrics.RealtimeRequests))
+			if v := realtimeRequestsByPath.WithLabelValues(category.Name); v != nil {
+				v.Set(float64(category.Metrics.RealtimeRequests))
+			}
 		}
 	}
 }
@@ -143,30 +132,26 @@ func fetchRealtimeRequestsByCode() {
 	defer ticker.Stop()
 
 	for range ticker.C {
-		var exporter httpStatusResponse
-		if err := fetchDataHTTPSTATUS(&exporter); err != nil {
+		var httpStatus httpStatusResponse
+		if err := fetchDataHTTPStatus(&httpStatus); err != nil {
 			log.Printf("Error fetching data: %v", err)
 			continue
 		}
 
-		if exporter.ModelName == "" {
+		if httpStatus.ModelName == "" || httpStatus.Categories == nil {
+			log.Println("Incomplete data received")
 			continue
 		}
 
-		if exporter.Categories == nil {
-			continue
-		}
-
-		for _, category := range exporter.Categories {
-			if category.Name == "" {
+		for _, category := range httpStatus.Categories {
+			if category.Name == "" || category.Metrics.RealtimeRequests == 0 {
 				continue
 			}
 
-			if category.Metrics.RealtimeRequests == 0 {
-				continue
+			metric := realtimeRequestsByCode.WithLabelValues(category.Name)
+			if metric != nil {
+				metric.Set(float64(category.Metrics.RealtimeRequests))
 			}
-
-			realtimeRequestsByCode.WithLabelValues(category.Name).Set(float64(category.Metrics.RealtimeRequests))
 		}
 	}
 }
@@ -182,104 +167,108 @@ func fetchDataTOP100(data *top100Response) error {
 		return errors.New("missing basic auth credentials")
 	}
 
-	url := getTop100URL()
+	configId := os.Getenv("NGENIX_CONFIG_ID")
+	date := time.Now()
+	metrics := []string{"realtimeRequests"}
+
+	url := getTop100URL(configId, date, metrics)
 
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, url, nil)
 	if err != nil {
-		return fmt.Errorf("error creating request: %v", err)
+		return fmt.Errorf("error creating request: %w", err)
 	}
 
 	req.SetBasicAuth(username, password)
 
 	client := &http.Client{
-		Transport: nil,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return nil
 		},
-		Jar:     nil,
-		Timeout: 0,
 	}
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("error executing request: %v", err)
+		return fmt.Errorf("error executing request: %w", err)
 	}
-
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("error fetching response: %v %v", resp.StatusCode, resp.Status)
+		return fmt.Errorf("unexpected status code: %d %s", resp.StatusCode, http.StatusText(resp.StatusCode))
 	}
 
-	if resp.Body == nil {
-		return errors.New("error fetching response: response body is nil")
-	}
-
-	err = json.NewDecoder(resp.Body).Decode(data)
-	if err != nil {
-		return fmt.Errorf("error decoding response: %v", err)
+	if err := json.NewDecoder(resp.Body).Decode(data); err != nil {
+		return fmt.Errorf("error decoding response: %w", err)
 	}
 
 	return nil
 }
 
-func fetchDataHTTPSTATUS(data *httpStatusResponse) error {
+func fetchDataHTTPStatus(data *httpStatusResponse) error {
 	if data == nil {
 		return errors.New("data parameter is nil")
 	}
 
-	username := os.Getenv("NGENIX_USERNAME")
-	password := os.Getenv("NGENIX_PASSWORD")
+	username, password := os.Getenv("NGENIX_USERNAME"), os.Getenv("NGENIX_PASSWORD")
 	if username == "" || password == "" {
 		return errors.New("missing basic auth credentials")
 	}
 
-	url := getHTTPStatusURL()
+	configID := os.Getenv("NGENIX_CONFIG_ID")
+	date := time.Now()
+	metrics := []string{"realtimeRequests"}
+
+	url := getHTTPStatusURL(configID, date, metrics)
 
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, url, nil)
 	if err != nil {
-		return fmt.Errorf("error creating request: %v", err)
+		return fmt.Errorf("error creating request: %w", err)
 	}
 
 	req.SetBasicAuth(username, password)
 
-	client := &http.Client{
-		Transport: nil,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return nil
-		},
-		Jar:     nil,
-		Timeout: 0,
-	}
+	client := &http.Client{}
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("error executing request: %v", err)
+		return fmt.Errorf("error executing request: %w", err)
 	}
-
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("error fetching response: %v %v", resp.StatusCode, resp.Status)
-	}
-
-	if resp.Body == nil {
-		return errors.New("error fetching response: response body is nil")
+		return fmt.Errorf("unexpected status code: %d %s", resp.StatusCode, http.StatusText(resp.StatusCode))
 	}
 
 	err = json.NewDecoder(resp.Body).Decode(data)
 	if err != nil {
-		return fmt.Errorf("error decoding response: %v", err)
+		return fmt.Errorf("error decoding response: %w", err)
 	}
 
 	return nil
 }
 
-// TODO: Add variables configId, date, metrics
-func getTop100URL() string {
-	return "https://api.ngenix.net/reports/v1/analytical/top100?configId=91051&date=2025-01-02&metrics=realtimeRequests"
+func getTop100URL(configId string, date time.Time, metrics []string) string {
+	if configId == "" || date.IsZero() || metrics == nil {
+		return ""
+	}
+
+	params := url.Values{}
+	params.Set("configId", configId)
+	params.Set("date", date.Format("2006-01-02"))
+	params.Set("metrics", strings.Join(metrics, ","))
+
+	return fmt.Sprintf("https://api.ngenix.net/reports/v1/analytical/top100?%s", params.Encode())
 }
 
-func getHTTPStatusURL() string {
-	return "https://api.ngenix.net/reports/v1/analytical/httpstatuses?configId=91051&start=2025-01-02T00:00:00&end=2025-01-02T23:59:59&metrics=realtimeRequests"
+func getHTTPStatusURL(configId string, date time.Time, metrics []string) string {
+	if configId == "" || date.IsZero() || metrics == nil {
+		return ""
+	}
+
+	params := url.Values{}
+	params.Set("configId", configId)
+	params.Set("start", date.Format("2006-01-02")+"T00:00:00")
+	params.Set("end", date.Format("2006-01-02")+"T23:59:59")
+	params.Set("metrics", strings.Join(metrics, ","))
+
+	return fmt.Sprintf("https://api.ngenix.net/reports/v1/analytical/httpstatuses?%s", params.Encode())
 }
